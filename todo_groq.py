@@ -91,12 +91,29 @@ conn.commit()
 def get_tasks():
     cursor.execute("SELECT id, title FROM tasks WHERE completed = 0")
     return cursor.fetchall()
+
+def get_completed_tasks():
+    cursor.execute("SELECT id, title FROM tasks WHERE completed = 1")
+    return cursor.fetchall()
  
 def format_tasks_for_prompt():
     tasks = get_tasks()
-    if not tasks:
-        return "No pending tasks."
-    return "\n".join(f"{task_id}: {title}" for task_id, title in tasks)
+    completed_tasks = get_completed_tasks()
+    result = ""
+    if tasks:
+        result += "Pending Tasks:\n"
+        result += "\n".join(f"{task_id}: {title}" for task_id, title in tasks)
+    else:
+        result += "No pending tasks."
+    
+    if completed_tasks:
+        if result:
+            result += "\n\nCompleted Tasks:\n"
+        else:
+            result += "Completed Tasks:\n"
+        result += "\n".join(f"{task_id}: {title}" for task_id, title in completed_tasks)
+    
+    return result
  
 def add_task(title):
     cursor.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
@@ -106,7 +123,7 @@ def complete_task(task_id):
     cursor.execute("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
     conn.commit()
 
-def Readd_task(task_id):
+def readd_task(task_id):
     cursor.execute("UPDATE tasks SET completed = 0 WHERE id = ?", (task_id,))
     conn.commit()
  
@@ -150,8 +167,8 @@ Current task list:
                 add_task(a["title"])
             elif a["action"] == "complete_task":
                 complete_task(a["id"])
-            elif a["action"] == "Readd_task":
-                complete_task(a["id"])
+            elif a["action"] == "readd_task":
+                readd_task(a["id"])
             elif a["action"] == "delete_task":
                 delete_task(a["id"])
  
@@ -218,8 +235,8 @@ def handle_send(event=None):
             log_message("AI", f"Added task: {a['title']}")
         elif a["action"] == "complete_task":
             log_message("AI", f"Completed task {a['id']}")
-        elif a["action"] == "Readd_Task":
-            log_message("AI", f"Readd task {a['id']}")
+        elif a["action"] == "readd_task":
+            log_message("AI", f"Reactivated task {a['id']}")
         elif a["action"] == "delete_task":
             log_message("AI", f"Deleted task {a['id']}")
  
