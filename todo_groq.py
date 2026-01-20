@@ -3,6 +3,9 @@ import json
 import sqlite3
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import threading
+import queue
+import ctypes
 from groq import Groq
  
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -35,7 +38,7 @@ Rules:
 - If intent is unclear or no task-related action is implied, return "none"
  
 Return ONLY valid JSON in this format:
- 
+
 {
   "actions": [
     { "action": "add_task", "title": "..." },
@@ -74,10 +77,9 @@ Response:
 If unsure, respond with:
 { "action": "none" } 
 """
- 
-conn = sqlite3.connect("tasks.db")
+conn = sqlite3.connect("tasks.db", check_same_thread=False) 
 cursor = conn.cursor()
- 
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,149 +87,303 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed INTEGER DEFAULT 0
 )
 """)
- 
 conn.commit()
- 
+
+db_lock = threading.Lock()
+
 def get_tasks():
-    cursor.execute("SELECT id, title FROM tasks WHERE completed = 0")
-    return cursor.fetchall()
- 
+    with db_lock:
+        cursor.execute("SELECT id, title FROM tasks WHERE completed = 0")
+        return cursor.fetchall()
+
+def get_completed_tasks():
+    with db_lock:
+        cursor.execute("SELECT id, title FROM tasks WHERE completed = 1")
+        return cursor.fetchall()
+
+def add_task(title):
+    with db_lock:
+        cursor.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
+        conn.commit()
+
+def complete_task(task_id):
+    with db_lock:
+        cursor.execute("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
+        conn.commit()
+
+def readd_task(task_id):
+    with db_lock:
+        cursor.execute("UPDATE tasks SET completed = 0 WHERE id = ?", (task_id,))
+        conn.commit()
+
+def delete_task(task_id):
+    with db_lock:
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+
 def format_tasks_for_prompt():
     tasks = get_tasks()
-    if not tasks:
-        return "No pending tasks."
-    return "\n".join(f"{task_id}: {title}" for task_id, title in tasks)
- 
-def add_task(title):
-    cursor.execute("INSERT INTO tasks (title) VALUES (?)", (title,))
-    conn.commit()
- 
-def complete_task(task_id):
-    cursor.execute("UPDATE tasks SET completed = 1 WHERE id = ?", (task_id,))
-    conn.commit()
+    completed_tasks = get_completed_tasks()
+    result = ""
+    if tasks:
+        result += "Pending Tasks:\n"
+        result += "\n".join(f"{task_id}: {title}" for task_id, title in tasks)
+    else:
+        result += "No pending tasks."
+    
+    if completed_tasks:
+        result += "\n\nCompleted Tasks:\n" if result else "Completed Tasks:\n"
+        result += "\n".join(f"{task_id}: {title}" for task_id, title in completed_tasks)
+    return result
 
-def Readd_task(task_id):
-    cursor.execute("UPDATE tasks SET completed = 0 WHERE id = ?", (task_id,))
-    conn.commit()
- 
-def delete_task(task_id):
-    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    conn.commit()
- 
-def interpret_message_loop(message, max_iters=5):
+def process_message_thread(message, callback_queue):
     all_actions = [] 
-    for _ in range(max_iters):
-        task_context = format_tasks_for_prompt()
-        system_prompt = SYSTEM_PROMPT + f"""
-Current task list:
-{task_context}
-"""
- 
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
-            temperature=0
-        )
- 
-        content = response.choices[0].message.content
- 
-        try:
-            data = json.loads(content)
-            actions = data.get("actions", [])
-        except json.JSONDecodeError:
-            break
- 
-        if not actions:
-            break
- 
-        all_actions.extend(actions)
- 
-        for a in actions:
-            if a["action"] == "add_task":
-                add_task(a["title"])
-            elif a["action"] == "complete_task":
-                complete_task(a["id"])
-            elif a["action"] == "Readd_task":
-                complete_task(a["id"])
-            elif a["action"] == "delete_task":
-                delete_task(a["id"])
- 
-    return all_actions
- 
+    max_iters = 5
+    
+    try:
+        for i in range(max_iters):
+            
+            task_context = format_tasks_for_prompt()
+            system_prompt = SYSTEM_PROMPT + f"\nCurrent task list:\n{task_context}\n"
+    
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": message}
+                ],
+                temperature=0
+            )
+    
+            content = response.choices[0].message.content
+            
+            try:
+                data = json.loads(content)
+                actions = data.get("actions", [])
+            except json.JSONDecodeError:
+                break
+    
+            if not actions:
+                break
+    
+            all_actions.extend(actions)
+            
+            for a in actions:
+                if a["action"] == "add_task":
+                    add_task(a["title"])
+                    callback_queue.put(("log", f"Added task: {a['title']}"))
+                elif a["action"] == "complete_task":
+                    complete_task(a["id"])
+                    callback_queue.put(("log", f"Completed task {a['id']}"))
+                elif a["action"] == "readd_task":
+                    readd_task(a["id"])
+                    callback_queue.put(("log", f"Reactivated task {a['id']}"))
+                elif a["action"] == "delete_task":
+                    delete_task(a["id"])
+                    callback_queue.put(("log", f"Deleted task {a['id']}"))
+            
+            callback_queue.put(("refresh", None))
+            
+    except Exception as e:
+        callback_queue.put(("log", f"Error: {str(e)}"))
+
+    callback_queue.put(("done", None))
+
 root = tk.Tk()
 root.title("Taskanator")
 root.geometry("900x500")
- 
+
+def apply_dark_title_bar():
+    root.update()
+    try:
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        value = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), 4)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(value), 4)
+    except Exception:
+        pass
+apply_dark_title_bar()
+
+COLORS = {
+    "bg_main": "#36393f",
+    "bg_sec": "#2f3136",
+    "bg_ter": "#202225",
+    "text": "#dcddde",
+    "accent": "#5865F2",
+    "success": "#57F287",
+    "entry_bg": "#40444b",
+    "selection": "#5865F2",
+    "scrollbar": "#202225",
+    "thumb": "#202225",
+    "arrow": "#dcddde"
+}
+
+root.configure(bg=COLORS["bg_main"])
+
+style = ttk.Style()
+style.theme_use('clam') 
+
+style.configure("TFrame", background=COLORS["bg_main"])
+style.configure("TLabel", background=COLORS["bg_sec"], foreground=COLORS["text"], font=("Segoe UI", 12))
+style.configure("Header.TLabel", background=COLORS["bg_sec"], foreground=COLORS["text"], font=("Segoe UI", 11, "bold"))
+style.configure("TButton", 
+                background=COLORS["accent"], 
+                foreground="white", 
+                borderwidth=0, 
+                focuscolor=COLORS["accent"],
+                font=("Segoe UI", 10, "bold"))
+style.map("TButton", background=[("active", "#4752c4")]) 
+
+style.configure("TEntry", 
+                fieldbackground=COLORS["entry_bg"], 
+                foreground=COLORS["text"], 
+                insertcolor=COLORS["text"],
+                borderwidth=0)
+
+style.layout("Dark.Vertical.TScrollbar",
+             [('Vertical.Scrollbar.trough',
+               {'children': [('Vertical.Scrollbar.thumb', 
+                              {'expand': '1', 'sticky': 'nswe'})],
+                'sticky': 'ns'})])
+
+style.configure("Dark.Vertical.TScrollbar", 
+                main_background=COLORS["scrollbar"],
+                troughcolor=COLORS["scrollbar"],
+                background=COLORS["entry_bg"],
+                arrowcolor=COLORS["arrow"],
+                bordercolor=COLORS["bg_sec"],
+                lightcolor=COLORS["entry_bg"],
+                darkcolor=COLORS["entry_bg"],
+                relief="flat",
+                borderwidth=0)
+
+style.map("Dark.Vertical.TScrollbar",
+          background=[('active', COLORS["accent"]), ('!disabled', COLORS["entry_bg"])],
+          arrowcolor=[('active', 'white'), ('!disabled', COLORS["arrow"])])
+
+def make_dark_scrollbar(master):
+    return ttk.Scrollbar(master, orient="vertical", style="Dark.Vertical.TScrollbar")
+
+msg_queue = queue.Queue()
+
+def check_queue():
+    while not msg_queue.empty():
+        msg_type, content = msg_queue.get()
+        if msg_type == "log":
+            log_message("AI", content)
+        elif msg_type == "refresh":
+            refresh_tasks()
+        elif msg_type == "done":
+            send_button.config(state="normal", text="Send")
+            user_input.config(state="normal")
+            user_input.delete(0, tk.END)
+            user_input.focus()
+    root.after(100, check_queue)
+
 main_frame = ttk.Frame(root)
 main_frame.pack(fill=tk.BOTH, expand=True)
- 
-task_frame = ttk.Frame(main_frame, width=250)
+
+task_frame = tk.Frame(main_frame, bg=COLORS["bg_sec"], width=250)
 task_frame.pack(side=tk.LEFT, fill=tk.Y)
- 
-task_label = ttk.Label(task_frame, text="Pending Tasks", font=("Arial", 12, "bold"))
-task_label.pack(pady=5)
- 
-task_listbox = tk.Listbox(task_frame)
-task_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
- 
-chat_frame = ttk.Frame(main_frame)
+task_frame.pack_propagate(False)
+
+task_header = tk.Label(task_frame, text="PENDING TASKS", bg=COLORS["bg_sec"], fg="#8e9297", font=("Segoe UI", 9, "bold"))
+task_header.pack(pady=(15, 10), padx=10, anchor="w")
+
+task_list_container = tk.Frame(task_frame, bg=COLORS["bg_sec"])
+task_list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+task_scrollbar = make_dark_scrollbar(task_list_container)
+task_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+task_listbox = tk.Listbox(task_list_container, 
+                          bg=COLORS["bg_sec"], 
+                          fg=COLORS["text"], 
+                          bd=0, 
+                          highlightthickness=0,
+                          selectbackground=COLORS["selection"],
+                          font=("Segoe UI", 10),
+                          yscrollcommand=task_scrollbar.set)
+task_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+task_scrollbar.config(command=task_listbox.yview)
+
+chat_frame = tk.Frame(main_frame, bg=COLORS["bg_main"])
 chat_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
- 
-chat_log = scrolledtext.ScrolledText(chat_frame, state="disabled", wrap=tk.WORD)
-chat_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
- 
-input_frame = ttk.Frame(chat_frame)
-input_frame.pack(fill=tk.X)
- 
-user_input = ttk.Entry(input_frame)
-user_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
- 
-send_button = ttk.Button(input_frame, text="Send")
-send_button.pack(side=tk.RIGHT, padx=5)
- 
+
+chat_container = tk.Frame(chat_frame, bg=COLORS["bg_main"])
+chat_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+chat_scrollbar = make_dark_scrollbar(chat_container)
+chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+chat_log = tk.Text(chat_container, 
+                   state="disabled", 
+                   wrap=tk.WORD, 
+                   bg=COLORS["bg_main"], 
+                   fg=COLORS["text"],
+                   bd=0,
+                   font=("Segoe UI", 10),
+                   insertbackground=COLORS["text"],
+                   yscrollcommand=chat_scrollbar.set)
+chat_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+chat_scrollbar.config(command=chat_log.yview)
+
+input_frame = tk.Frame(chat_frame, bg=COLORS["bg_main"])
+input_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
+
+entry_bg_frame = tk.Frame(input_frame, bg=COLORS["entry_bg"], bd=0)
+entry_bg_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+
+user_input = tk.Entry(entry_bg_frame, 
+                      bg=COLORS["entry_bg"], 
+                      fg=COLORS["text"], 
+                      bd=0, 
+                      insertbackground=COLORS["text"],
+                      disabledbackground=COLORS["entry_bg"],
+                      disabledforeground=COLORS["text"],
+                      font=("Segoe UI", 10))
+user_input.pack(fill=tk.X, expand=True, padx=10)
+
+send_button = ttk.Button(input_frame, text="Send", cursor="hand2")
+send_button.pack(side=tk.RIGHT, padx=(10, 0))
+
 def refresh_tasks():
     task_listbox.delete(0, tk.END)
     for task_id, title in get_tasks():
         task_listbox.insert(tk.END, f"{task_id}. {title}")
- 
+
 def log_message(sender, message):
     chat_log.configure(state="normal")
-    chat_log.insert(tk.END, f"{sender}: {message}\n")
+    
+    tag = "user_tag" if sender == "You" else "ai_tag"
+    chat_log.tag_config("user_tag", foreground="#ffffff", font=("Segoe UI", 10, "bold"))
+    chat_log.tag_config("ai_tag", foreground=COLORS["accent"], font=("Segoe UI", 10, "bold"))
+    
+    chat_log.insert(tk.END, f"{sender}: ", tag)
+    chat_log.insert(tk.END, f"{message}\n")
     chat_log.configure(state="disabled")
     chat_log.yview(tk.END)
- 
+
 def handle_send(event=None):
     message = user_input.get().strip()
     if not message:
         return
- 
+
     user_input.delete(0, tk.END)
     log_message("You", message)
- 
-    actions = interpret_message_loop(message)
- 
-    if not actions:
-        log_message("AI", "I didn't understand that")
-        return
- 
-    for a in actions:
-        if a["action"] == "add_task":
-            log_message("AI", f"Added task: {a['title']}")
-        elif a["action"] == "complete_task":
-            log_message("AI", f"Completed task {a['id']}")
-        elif a["action"] == "Readd_Task":
-            log_message("AI", f"Readd task {a['id']}")
-        elif a["action"] == "delete_task":
-            log_message("AI", f"Deleted task {a['id']}")
- 
-    refresh_tasks()
-    refresh_tasks()
- 
+    
+    send_button.config(state="disabled", text="Processing...")
+    
+    user_input.config(state="normal")
+    user_input.insert(0, "....")
+    user_input.config(state="disabled")
+    
+    t = threading.Thread(target=process_message_thread, args=(message, msg_queue))
+    t.start()
+    
 send_button.config(command=handle_send)
 user_input.bind("<Return>", handle_send)
- 
+
+check_queue()
 refresh_tasks()
 root.mainloop()
