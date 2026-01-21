@@ -4,7 +4,8 @@ import sqlite3
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from groq import Groq
- 
+
+git.ignore
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
  
 MODEL = "openai/gpt-oss-120b"
@@ -248,3 +249,4 @@ user_input.bind("<Return>", handle_send)
  
 refresh_tasks()
 root.mainloop()
+
