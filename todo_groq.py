@@ -7,6 +7,8 @@ import threading
 import queue
 import ctypes
 from groq import Groq
+import datetime
+from mem0 import MemoryClient
  
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
  
@@ -90,9 +92,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 conn.commit()
 
 db_lock = threading.Lock()
-
-import datetime
-from mem0 import MemoryClient
 
 
 MEM0_API_KEY = "m0-tbkfm1gH6vXbyxcai95db0gjbttxrHMrui4HHnUr"
@@ -496,3 +495,4 @@ threading.Thread(target=smart_reactivation_check, args=(msg_queue,), daemon=True
 
 refresh_tasks()
 root.mainloop()
+
