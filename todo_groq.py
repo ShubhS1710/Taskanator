@@ -94,7 +94,7 @@ conn.commit()
 db_lock = threading.Lock()
 
 
-MEM0_API_KEY = "m0-tbkfm1gH6vXbyxcai95db0gjbttxrHMrui4HHnUr"
+MEM0_API_KEY = "Insert_api_key"
 mem_client = MemoryClient(api_key=MEM0_API_KEY)
 USER_ID = "taskanator_user"
 
@@ -495,4 +495,5 @@ threading.Thread(target=smart_reactivation_check, args=(msg_queue,), daemon=True
 
 refresh_tasks()
 root.mainloop()
+
 
