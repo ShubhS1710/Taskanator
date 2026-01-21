@@ -27,7 +27,7 @@
 1. Visit the Mem0 dashboard:
    [https://app.mem0.ai/dashboard](https://app.mem0.ai/dashboard)
 2. Create an API key.
-3. Paste the API key into the location in the code where `"your_api_key"` is specified.
+3. Paste the API key into the location in the code where `"insert_api_key"` is specified.
 
 ---
 
